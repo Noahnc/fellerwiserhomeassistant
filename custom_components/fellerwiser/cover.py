@@ -1,110 +1,60 @@
 """Platform for cover integration."""
+
 from __future__ import annotations
 
 import logging
+from typing import Any
 
-import requests
-import websockets
-import asyncio
-import json
-import socket
+from homeassistant.components.cover import ATTR_POSITION, CoverEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
 
-import voluptuous as vol
-from .const import (
-    DOMAIN,
-)
-
-# Import the device class from the component that you want to support
-from homeassistant.components.cover import (
-    ATTR_POSITION,
-    CoverEntity,
-)
+from .const import REQUEST_TIMEOUT_SECONDS
+from .feller_client import FellerApiClient
+from .main import WISER_ENTITIES
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def hello(covers, hass, host, apikey):
-    ip = host
+async def async_setup_entry(
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities
+) -> None:
+    """Set up all the Feller Climate Entities."""
+    host = entry.data["host"]
+    apikey = entry.data["apikey"]
 
-    while True:
-    # outer loop restarted every time the connection fails
-        _LOGGER.info('Creating new connection...')
-        try:
-            async with websockets.connect("ws://"+ip+"/api", additional_headers={'authorization':'Bearer ' + apikey}, ping_timeout=None) as ws:
-                while True:
-                # listener loop
-                    try:
-                        result = await asyncio.wait_for(ws.recv(), timeout=None)
-                    except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
-                        try:
-                            pong = await ws.ping()
-                            await asyncio.wait_for(pong, timeout=None)
-                            _LOGGER.info('Ping OK, keeping connection alive...')
-                            continue
-                        except:
-                            _LOGGER.info(
-                                'Ping error - retrying connection in {} sec (Ctrl-C to quit)'.format(10))
-                            await asyncio.sleep(10)
-                            break
-                    _LOGGER.info('Server said > {}'.format(result))
-                    data = json.loads(result)     
-                    for l in covers:
-                        if l.unique_id == "cover-"+str(data["load"]["id"]):
-                            _LOGGER.info("found entity to update")
-                            l.updateExternal(data["load"]["state"]["level"], data["load"]["state"]["moving"])
-        except socket.gaierror:
-            _LOGGER.info(
-                'Socket error - retrying connection in {} sec (Ctrl-C to quit)'.format(10))
-            await asyncio.sleep(10)
-            continue
-        except ConnectionRefusedError:
-            _LOGGER.info('Nobody seems to listen to this endpoint. Please check the URL.')
-            _LOGGER.info('Retrying connection in {} sec (Ctrl-C to quit)'.format(10))
-            await asyncio.sleep(10)
-            continue
-        except KeyError:
-            _LOGGER.info("KeyError")
-            continue
+    client = FellerApiClient(host, apikey, REQUEST_TIMEOUT_SECONDS)
+    result = await client.get_all_loads_async()
 
-def updatedata(host, apikey):
-    #ip = "192.168.0.18"
-    ip = host
-    key = apikey
-    return requests.get("http://"+ip+"/api/loads", headers= {'authorization':'Bearer ' + key})
-
-async def async_setup_entry(hass, entry, async_add_entities):
-    host = entry.data['host']
-    apikey = entry.data['apikey']
-
-    _LOGGER.info("---------------------------------------------- %s %s", host, apikey)
-
-    response = await hass.async_add_executor_job(updatedata, host, apikey)
-
-    loads = response.json()
-
-    covers= []
-    for value in loads["data"]:
+    cover_entries = []
+    for value in result.data:
         if value["type"] == "motor":
-            covers.append(FellerCover(value, host, apikey))
+            if value["unused"]:
+                continue
+            cover_entries.append(FellerCover(value, client))
 
-    asyncio.get_event_loop().create_task(hello(covers, hass, host, apikey))
-    async_add_entities(covers, True)
+    WISER_ENTITIES.extend(cover_entries)
+
+    async_add_entities(cover_entries, True)
 
 
 class FellerCover(CoverEntity):
+    """Represents an Feller Cover."""
 
-    def __init__(self, data, host, apikey) -> None:
+    def __init__(self, data, client: FellerApiClient) -> None:
+        """Initialize an Feller Cover."""
+        self._state = None
         self._data = data
         self._name = data["name"]
         self._id = str(data["id"])
+        self._wiser_id = data["id"]
         self._is_opening = False
         self._is_closing = False
         self._is_opened = False
         self._is_closed = False
         self._is_partially_opened = False
         self._position = None
-        self._host = host
-        self._apikey = apikey
+        self._client: FellerApiClient = client
 
     @property
     def name(self) -> str:
@@ -113,6 +63,10 @@ class FellerCover(CoverEntity):
     @property
     def unique_id(self):
         return "cover-" + self._id
+
+    @property
+    def wiser_entity_id(self):
+        return self._wiser_id
 
     @property
     def current_cover_position(self):
@@ -137,63 +91,52 @@ class FellerCover(CoverEntity):
     @property
     def is_partially_opened(self) -> bool | None:
         return self._is_partially_opened
-    
+
     @property
     def should_poll(self) -> bool | None:
         return False
 
-    def open_cover(self, **kwargs: Any) -> None:
+    async def async_open_cover(self, **kwargs: Any) -> None:
+        """Open the cover."""
         self._position = kwargs.get(ATTR_POSITION, 100)
-        ip = self._host
-        response = requests.put("http://"+ip+"/api/loads/"+self._id+"/target_state", headers= {'authorization':'Bearer ' + self._apikey}, json={'level': 0})
-        _LOGGER.info(response.json())
+        result = await self._client.set_cover_level_async(self._wiser_id, 0)
         self._state = True
-        self._position = 100-(response.json()["data"]["target_state"]["level"]/100)
+        self._position = 100 - (result.data["target_state"]["level"] / 100)
 
-    def close_cover(self, **kwargs: Any) -> None:
+    async def async_close_cover(self, **kwargs: Any) -> None:
+        """Close the cover."""
         self._position = kwargs.get(ATTR_POSITION, 100)
-        ip = self._host
-        response = requests.put("http://"+ip+"/api/loads/"+self._id+"/target_state", headers= {'authorization':'Bearer ' + self._apikey}, json={'level': 10000})
-        _LOGGER.info(response.json())
+        result = await self._client.set_cover_level_async(self._wiser_id, 10000)
         self._state = True
-        self._position = 100-(response.json()["data"]["target_state"]["level"]/100)
+        self._position = 100 - (result.data["target_state"]["level"] / 100)
 
-    def set_cover_position(self, **kwargs: Any) -> None:
+    async def async_set_cover_position(self, **kwargs: Any) -> None:
         self._position = kwargs.get(ATTR_POSITION, 100)
-        ip = self._host
-        response = requests.put("http://"+ip+"/api/loads/"+self._id+"/target_state", headers= {'authorization':'Bearer ' + self._apikey}, json={'level': (100-self._position)*100})
-        _LOGGER.info(response.json())
+        result = await self._client.set_cover_level_async(
+            self._wiser_id, (100 - self._position) * 100
+        )
         self._state = True
-        self._position = 100-(response.json()["data"]["target_state"]["level"]/100)
+        self._position = 100 - (result.data["target_state"]["level"] / 100)
 
-    def stop_cover(self, **kwargs: Any) -> None:
-        ip = self._host
-        response = requests.put("http://"+ip+"/api/loads/"+self._id+"/ctrl", headers= {'authorization':'Bearer ' + self._apikey}, json={'button': "stop", 'event': 'click'})
-        _LOGGER.info(response.json())
+    async def async_stop_cover(self, **kwargs: Any) -> None:
+        await self._client.send_load_ctrl_event_async(
+            self._wiser_id, {"button": "stop", "event": "click"}
+        )
 
+    async def async_update(self) -> None:
+        result = await self._client.get_load_async(self._wiser_id)
 
-    def updatestate(self):
-        ip = self._host
-        # _LOGGER.info("requesting http://"+ip+"/api/loads/"+self._id)
-        return requests.get("http://"+ip+"/api/loads/"+self._id, headers= {'authorization':'Bearer ' + self._apikey})
+        # ha: 100 = open, 0 = closed
+        # feller: 10000 = closed, 0 = open
+        self._position = 100 - (result.data["state"]["level"] / 100)
 
-
-    def update(self) -> None:
-        response = self.updatestate()
-        load = response.json()
-        _LOGGER.info(load)
-
-        #ha: 100 = open, 0 = closed
-        #feller: 10000 = closed, 0 = open
-        self._position = 100-(load["data"]["state"]["level"]/100)
-
-        if load["data"]["state"]["moving"] == "stop":
+        if result.data["state"]["moving"] == "stop":
             self._is_closing = False
             self._is_opening = False
-        if load["data"]["state"]["moving"]  == "up":
+        if result.data["state"]["moving"] == "up":
             self._is_closing = False
             self._is_opening = True
-        if load["data"]["state"]["moving"] == "down":
+        if result.data["state"]["moving"] == "down":
             self._is_closing = True
             self._is_opening = False
 
@@ -209,9 +152,30 @@ class FellerCover(CoverEntity):
             self._is_closed = False
             self._is_opened = False
             self._is_partially_opened = True
-    
-    def updateExternal(self, position, moving):
-        self._position = 100-(position/100)
+
+    def update_from_websocket_message(self, message):
+        """Updates the cover state from an websocket message."""
+
+        if "load" not in message:
+            _LOGGER.debug(
+                "No load in websocket message, skipping update of cover with id %s",
+                self._id,
+            )
+            return
+
+        message = message["load"]
+
+        if "state" not in message:
+            _LOGGER.debug(
+                "No state in websocket message, skipping update of cover with id %s",
+                self._id,
+            )
+            return
+
+        position = message["state"]["level"]
+        moving = message["state"]["moving"]
+
+        self._position = 100 - (position / 100)
 
         if moving == "stop":
             self._is_closing = False
